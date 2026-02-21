@@ -42,6 +42,7 @@ import os.path
 import re  # TODO use regex when it will be standard
 import sys
 from io import StringIO
+from multiprocessing import Queue, cpu_count, get_context
 from timeit import default_timer
 import inspect
 extract_path = os.path.realpath(os.path.abspath(os.path.join(os.path.split(inspect.getfile( inspect.currentframe() ))[0],"extract")))
@@ -519,7 +520,7 @@ def preprocess_dump(input_file, template_file, expand_templates=True):
 
 
 def process_dump_script(input_opened,input_file, out_file, file_size, file_compress,
-                 file_extension,urlbase):
+                 file_extension,urlbase, process_count):
     # Write to docs or to stdout.
 
     # Output configuration if path is stdout
@@ -537,25 +538,83 @@ def process_dump_script(input_opened,input_file, out_file, file_size, file_compr
     logging.info("Starting page extraction from %s.", input_file )
     extract_start = default_timer()
 
-    ordinal = 1  # page count
+    if not process_count or process_count <= 1:
+        ordinal = 1  # page count
 
-    for id, revid, title, page, metadata in collect_pages(input_opened): 
-        #out :output folder path
-        if ( Extractor(id, revid, urlbase, title, page, metadata).extract(output, html_safe=True) ):
-            ordinal += 1
-            #logging.debug("\t Doc. saved:" + str(ordinal))
-        #else empty doc
+        for id, revid, title, page, metadata in collect_pages(input_opened): 
+            #out :output folder path
+            if ( Extractor(id, revid, urlbase, title, page, metadata).extract(output, html_safe=True) ):
+                ordinal += 1
+                #logging.debug("\t Doc. saved:" + str(ordinal))
+            #else empty doc
+
+        input_opened.close()
+
+        # Script time statistics
+        if output != sys.stdout and not Extractor.generator:
+            output.close()
+        extract_duration = default_timer() - extract_start
+        extract_rate = ordinal / extract_duration
+        logging.info("Finished 1-process extraction of %d articles in %.1fs (%.1f art/s)",
+                    ordinal, extract_duration, extract_rate)
+
+        return
+
+    # Parallel Map/Reduce:
+    # - pages to be processed are dispatched to workers
+    # - a reduce process collects the results, sort them and print them.
+
+    # fixes MacOS error: TypeError: cannot pickle '_io.TextIOWrapper' object
+    Process = get_context("fork").Process
+
+    maxsize = 10 * process_count
+    # output queue
+    output_queue = Queue(maxsize=maxsize)
+
+    # Reduce job that sorts and prints output
+    reduce = Process(target=reduce_process, args=(output_queue, output))
+    reduce.start()
+
+    # initialize jobs queue
+    jobs_queue = Queue(maxsize=maxsize)
+
+    # start worker processes
+    logging.info("Using %d extract processes.", process_count)
+    workers = []
+    for _ in range(max(1, process_count)):
+        extractor = Process(target=extract_process,
+                            args=(jobs_queue, output_queue, True))
+        extractor.daemon = True  # only live while parent process lives
+        extractor.start()
+        workers.append(extractor)
+
+    ordinal = 0  # page count
+    for id, revid, title, page, metadata in collect_pages(input_opened):
+        job = (id, revid, urlbase, title, page, metadata, ordinal)
+        jobs_queue.put(job)  # goes to any available extract_process
+        ordinal += 1
 
     input_opened.close()
 
+    # signal termination
+    for _ in workers:
+        jobs_queue.put(None)
+    # wait for workers to terminate
+    for w in workers:
+        w.join()
+
+    # signal end of work to reduce process
+    output_queue.put(None)
+    # wait for it to finish
+    reduce.join()
 
     # Script time statistics
     if output != sys.stdout and not Extractor.generator:
         output.close()
     extract_duration = default_timer() - extract_start
-    extract_rate = ordinal / extract_duration
-    logging.info("Finished 1-process extraction of %d articles in %.1fs (%.1f art/s)",
-                 ordinal, extract_duration, extract_rate)
+    extract_rate = ordinal / extract_duration if extract_duration else 0.0
+    logging.info("Finished %d-process extraction of %d articles in %.1fs (%.1f art/s)",
+                 process_count, ordinal, extract_duration, extract_rate)
 
     return
 
@@ -592,6 +651,23 @@ def process_dump_generator(input_opened,input_file, urlbase):
 
 
 
+
+
+def extract_process(jobs_queue, output_queue, html_safe):
+    """Pull tuples of raw page content, do CPU/regex-heavy fixup, push finished text
+    :param jobs_queue: where to get jobs.
+    :param output_queue: where to queue extracted text for output.
+    :html_safe: whether to convert entities in text to HTML.
+    """
+    while True:
+        job = jobs_queue.get()
+        if job is None:
+            break
+        out = StringIO()  # memory buffer
+        ok = Extractor(*job[:-1]).extract(out, html_safe=html_safe)
+        text = out.getvalue() if ok else ''
+        output_queue.put((job[-1], text))  # (ordinal, extracted_text)
+        out.close()
 
 
 def reduce_process(output_queue, output):
@@ -693,6 +769,10 @@ def main(*args, **kwargs):
     groupP.add_argument("-ns", "--namespaces", default="", metavar="ns1,ns2",
                         help="accepted namespaces")
 
+    default_process_count = cpu_count() - 1
+    parser.add_argument("--processes", type=int, default=default_process_count,
+                        help="Number of processes to use (default %(default)s)")
+
     groupS = parser.add_argument_group('Special')
     groupS.add_argument("-q", "--quiet", action="store_true",
                         help="suppress reporting progress info")
@@ -786,7 +866,8 @@ def main(*args, **kwargs):
                                 file_size=file_size,
                                 file_compress=args.compress,
                                 file_extension=file_extension,
-                                urlbase = urlbase
+                                urlbase = urlbase,
+                                process_count = args.processes
                             )
 
 
